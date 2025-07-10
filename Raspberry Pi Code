@@ -1,0 +1,186 @@
+import RPi.GPIO as GPIO #Assuming Raspberry Pi is up to date and Picamera2 library is installed
+from picamera2 import Picamera2, Preview
+from picamera2.encoders import H264Encoder, Quality
+from datetime import datetime
+import time
+import threading # Import threatding for capturing images in seperate thread
+import os
+import csv
+from picamera2.outputs import FileOutput
+
+#GENERAL SETUP
+#Pin Configuration
+SOLENOID_VALVE_WATER = 23 # GPIO pin for solenoid valve connected to water beaker
+SOLENOID_VALVE_PB = 24 #GPIO pin for solenoid valve connected to diluted peanut butter beaker
+SOLENOID_VALVE_NOSE = 25 #GPIO pin for solenoid valve in front of nose
+
+#GPIO Setup
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SOLENOID_VALVE_WATER, GPIO.OUT)
+GPIO.setup(SOLENOID_VALVE_PB, GPIO.OUT)
+GPIO.setup(SOLENOID_VALVE_NOSE, GPIO.OUT)
+#Global Variables Stated
+device_states = {
+    """Dictionary used to store device states"""
+    'valve_water': False, #Leaving vallves off by default so we can expose mice to scents when we want to
+    'valve_pb': False,
+    'valve_nose': False
+    }
+#stop_thread = False
+image_capture_thread_running = False
+thread = None
+lock = threading.Lock()
+output_dir = '/home/face01/Desktop/Diva_Rig_Code'
+timestamp = time.strftime("%Y-%m-%-d-%H:%M:%S")
+
+timestamp_file = os.path.join(output_dir, datetime.now().strftime("%Y-%m%-d-%H:%M:%S") + '_timestamps.txt')
+raw_video_file = os.path.join(output_dir, datetime.now().strftime("%Y-%m%-d-%H:%M:%S") + '_Rig.raw')
+vfilename = os.path.join(output_dir, datetime.now().strftime("%Y-%m%-d-%H:%M:%S") + '_Rig.h264')
+timefilename = "frame_timestamps_" + timestamp + ".csv"
+def capture_timestamp_frames():
+    with open(timefilename, mode='w', newline ='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Timestamp. Experiment began at: " + timestamp]) #Write Header
+    while True:
+        current_timestamp = [time.time()]
+        with open(timefilename, mode='a', newline='') as file: # Open in append mode
+            writer = csv.writer(file)
+            writer.writerow(current_timestamp)
+        time.sleep(1/30) #Delay between frames
+timestamp_thread = threading.Thread(target=capture_timestamp_frames)
+timestamp_thread.start()
+            
+#Initialize Picamera2
+picam2 = Picamera2() #Create object for picam2
+video_config = picam2.create_video_configuration(main={"size": (1296, 972)}) #Make camera configuration suitable for video
+picam2.configure(video_config)
+picam2.set_controls({"FrameRate": 30})
+encoder = H264Encoder(10000000) #Bitrate of 10Mbps
+output = FileOutput(vfilename)
+
+picam2.start_preview(Preview.QTGL)
+picam2.start_recording (encoder, vfilename, pts=timestamp_file, quality = Quality.HIGH, config = video_config) #Start the video
+
+#METHODS DEFINED BELOW
+
+def take_pic(liquid_type):
+    """Captures pictures while recording.
+    Parameters: liquid_type"""
+    while not stop_thread: #Check if picture is being taken through another thread, if not then proceed to take picture
+        timestamp = time.strftime("%Y-%m-%d-%H:%M:%S")
+        filename = f"image_{liquid_type}_{timestamp}.jpg"
+        with picam2.capture_request() as request:
+            request.save("main" + filename)
+            metadata = request.metadata
+            if metadata is not None: #Check if metadata is valid
+                print(metadata)
+            else:
+                print("No metadata returned for this image")
+            #Request is released automatically when we leave scope of "with", in versions 0.3.19 or later
+def capture_image_thread(liquid_type):
+    """Runs image captring in separate thread to make program more effective
+    Parameters: liquid_type"""
+    global image_capture_thread_running
+    if not image_capture_thread_running: #Prevent multiple thrads
+        image_captre_thread_running = True
+        stop_thread = False #reset flag
+    with lock: #Added to prevent another picture being taken and causing errors if user presses "c" while thread is in process of taking picture
+        thread = threading.Thread(target = take_pic, arg = (liquid_type,)) # Start taking picture in new thread
+        thread.start()
+    return thread
+def state(device): #Generalizable method to make methods look slightly cleaner
+    if device:
+        return "ON"
+    else:
+        return "OFF"
+
+def pin_state(device):
+    return GPIO.HIGH if device else GPIO.LOW #General method to make methods look slightly cleaner
+
+def toogle_valve_water():
+    """Change state of water and nose valve from off to on and vice versa"""
+    device_states['valve_water'] = not device_states['valve_water'] #flip current state of water valve
+    GPIO.output (SOLENOID_VALVE_WATER, pin_state(device_states['valve_water'])) #Puts above line into action
+    print(f"Water Solenoid Valve {state(device_states['valve_water'])}") #Line for our own reference so we can keep track of what its open
+    if device_states['valve_water']: #If water valve is open...:
+        time.sleep(5) #Wait for water to travel through pipe before opening nose valve
+        device_states['valve_nose'] = not device_states ['valve_nose']
+        print(f"Nose Solenoid Valve ON at {time.strftime('%Y-%m-%d-%H:%M:%S')}")
+        time.sleep(5) #Wait for scent to reach nose before capturing image of brain
+        capture_image_thread("water") #Start a thread to take a picture, save file as timestamp of when image was taken
+        device_states['valve_water'] = not device_states['valve_water'] #Flips current state of water valve (turns it off)
+        GPIO.output(SOLENOID_VALVE_WATER, pin_state(device_states['valve_water'])) #Puts above line into action
+        print("Water Solenoid Valve OFF") #This line is for our own reference so we can keep track of what valves are open
+        device_states['valve_nose'] = not device_states ['valve_nose'] #Flips current state of nose valve; Since it's currently open, this line now records curent state of nose valve as off
+        GPIO.output(SOLENOID_VALVE_NOSE, pin_state(device_states['valve_nose'])) #Puts above line into action
+        print("Nose Solenoid Valve OFF") #This line for our reference so we can keep track of what valves are open
+
+def toogle_valve_pb():
+    """Change state of peanut butter and nose valve from off to on and vice versa"""
+    device_states['valve_pb'] = not device_states['valve_pb'] #flip current state of peanut butter valve
+    GPIO.output (SOLENOID_VALVE_PB, pin_state(device_states['valve_pb'])) #Puts above line into action
+    print(f"Peanut Buter Solenoid Valve {state(device_states['valve_pb'])}") #Line for our own reference so we can keep track of what its open
+    if device_states['valve_pb']: #If peanut butter valve is open...:
+        time.sleep(5) #Wait for peanut butter to travel through pipe before opening nose valve
+        device_states['valve_nose'] = not device_states ['valve_nose']
+        print(f"Nose Solenoid Valve ON at {time.strftime('%Y-%m-%d-%H:%M:%S')}")
+        time.sleep(5) #Wait for scent to reach nose before capturing image of brain
+        capture_image_thread("peanut_butter") #Start a thread to take a picture, save file as timestamp of when image was taken
+        device_states['valve_pb'] = not device_states['valve_pb'] #Flips current state of peanut butter valve (turns it off)
+        GPIO.output(SOLENOID_VALVE_, pin_state(device_states['valve_pb'])) #Puts above line into action
+        print("Peanut Butter Solenoid Valve OFF") #This line is for our own reference so we can keep track of what valves are open
+        device_states['valve_nose'] = not device_states ['valve_nose'] #Flips current state of nose valve; Since it's currently open, this line now records curent state of nose valve as off
+        GPIO.output(SOLENOID_VALVE_NOSE, pin_state(device_states['valve_nose'])) #Puts above line into action
+        print("Nose Solenoid Valve OFF") #This line for our reference so we can keep track of what valves are open
+
+def toggle_valve_nose(): #Defined this method to give us option to manually toggle nose valve if needed
+    """Change state of valve near nose from off to on and vice versa"""
+    device_states['valve_nose'] = not device_states['valve_nose']
+    GPIO.output(SOLENOID_NOSE_VALVE, pin_state(device_states['valve_nose']))
+    print(f"Nose Solenoid Valve {state(device_states['valve_nose'])}")
+    
+#Keyboard Mappings
+    #keyboard.add_hotkey('w', toggle_valve_water) #Press W for Water Solenoid Valve
+    #keyboard.add_hotkey('p', toggle_valve_pb) #Press P for Peanut Butter Solenoid Valve
+    #keyboard.add_hotkey('n', toggle_valve_nose) #Press N for Nose Solenoid Valve
+    #keyboard.add_hotkey('c', lambda: capture_image_thread("")) #Lambda creates a callable for hotkey; #Press C to capture an image (added this option if we wanted to manually caputre images as well)
+    #keyboard.add_hotkey('s', picam2.stop_recording()) #Press S to stop recording"""
+def check_keypress(): #check if there is a key press
+    rlist, _, _ = select.select([sys.stdin], [], [], 0)
+    if rlist:
+        return sys.stdin.read(1)
+    return None
+    
+try:
+    print("Press 'w' for Water Valve, 'p' for Peanut Butter Valve, 'n' for Nose Valve, 'c' for camera.")
+#keyboard.wait('esc') #Kep running until 'esc' is pressed
+    while True: # Infinite Loop
+        key = check_keypress
+        if key == 'z':
+            raise KeyboardInterrupt
+        if key == 'w':
+            print ("Water Valve Activated")
+            toggle_valve_water
+        elif key == 'p':
+            print ("Peanut Butter Valve Activated")
+            toggle_valve_pb
+        elif key == 'n':
+            print (" Nose Valve Activated")
+            toggle_valve_nose
+        elif key == 'c':
+            print ("Taking Picture...")
+            lambda: capture_image_thread("")
+except (KeyboardInterrupt, SystemExit):
+    print("Script Terminated by user")
+finally:
+    #stop_thread = True #Signal thread to stop
+    #if thread is not None:
+        #thread.join() #Wait for thread to finish if there is one ongoing
+    picam2.stop_recording() #Ensure recording is stopped before cleanup
+    print("Video Captured: " + vfilename) #Says video has been saved
+    #Turn off all devices before cleaning up:
+    GPIO.output(SOLENOID_VALVE_WATER, GPIO.LOW)
+    GPIO.output(SOLENOID_VALVE_PB, GPIO.LOW)
+    GPIO.output(SOLENOID_VALVE_NOSE, GPIO.LOW)
+    GPIO.cleanup() #Clean up GPIO settings once we've exited, to return all pins to default input state
